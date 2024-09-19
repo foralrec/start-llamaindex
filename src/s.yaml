@@ -1,0 +1,249 @@
+edition: 3.0.0
+name: start-llamaindex-dev
+access: {{ access }}
+
+vars: # 全局变量
+  region: "{{ region }}"
+  name: "{{ projectname }}"
+  model_type: "modelscope"
+#  dashscope_api_key: "{{ dashscope_api_key }}"
+
+resources:
+  VectorDB:
+    component: rds
+    props:
+      region: ${vars.region}
+      name: {{ db_name }}
+      engine: "PostgreSQL:16.0"
+      database: "{{ db_database }}"
+      username: "{{ db_username }}"
+      password: "{{ db_password }}"
+      vpcID: auto
+      extensions:
+        - name: vector
+
+  Embedding:
+    component: model
+    props:
+      region: ${vars.region}
+      role: "acs:ram::${config(\"AccountID\")}:role/aliyundevsdefaultrole"
+      name: ${vars.name}-embedding
+      description: "CAP 托管的 embedding 模型"
+      modelConfig:
+        framework: modelscope
+        sourceType: modelscope
+        srcModelScopeModelID: "{{ embedding_model }}"
+        srcModelScopeModelRevision:
+      cpu: 8
+      memorySize: 32768
+      diskSize: 10240
+      gpuConfig:
+        gpuMemorySize: 16384
+        gpuType: fc.gpu.tesla.1
+      nasConfig: auto
+      vpcConfig: auto
+      logConfig: auto
+      timeout: 6000
+      annotations:
+        instanceType: "{{ embedding_instance_type }}"
+      provisionConfig:
+        target: {{ embedding_instance_count }}
+        alwaysAllocateGPU: false
+        scheduledActions: []
+
+  LLM:
+    component: model
+    props:
+      region: ${vars.region}
+      name: ${vars.name}-llm
+      description: "CAP 托管的 ollama 服务，内置 llama3:8b 模型"
+      modelConfig:
+        sourceType: custom-container
+      role: "acs:ram::${config(\"AccountID\")}:role/aliyundevsdefaultrole"
+      timeout: 600
+      diskSize: 10240
+      cpu: 8
+      memorySize: 32768
+      gpuConfig:
+        gpuMemorySize: 16384
+        gpuType: fc.gpu.tesla.1
+      logConfig: auto
+      runtime: custom-container
+      customContainerConfig:
+        port: 8000
+        image: "registry.${vars.region}.aliyuncs.com/aliyun-fc/ollama:capv1"
+      httpTrigger: "auto"
+      environmentVariables:
+        MODEL: "llama3:8b"
+      # never used in deployment. Only used in console view
+      annotations:
+        modleID: "{{ llm_model}}"
+        instanceType: "{{ llm_instance_type }}"
+      provisionConfig:
+        target: {{ llm_instance_count }}
+        alwaysAllocateGPU: false
+        scheduledActions: []
+
+  OfflineEmbedding:
+    component: fc3
+    props:
+      region: ${vars.region}
+      functionName: ${vars.name}-offline-embedding
+      functionType: Task
+      description: "离线任务：将知识库内容向量化并存储到数据库"
+      runtime: "python3.10"
+      role: "{{ offline_role }}"
+      diskSize: 512
+      code: code/offline
+      handler: index.handler
+      memorySize: 1024
+      cpu: 1
+      timeout: 60
+      layers:
+        - acs:fc:cn-hangzhou:1767215449378635:layers/llamaindex/versions/1
+      logConfig: auto
+      vpcConfig: auto
+      instanceLifecycleConfig:
+        initializer:
+          handler: index.initializer
+          timeout: 30
+      environmentVariables:
+        PYTHONPATH: /code/python
+        PG_HOST: ${resources.VectorDB.output.host}
+        PG_DATABASE: ${resources.VectorDB.props.database}
+        TABLE_NAME: "llamaindex_default"
+        PG_USER: ${resources.VectorDB.props.username}
+        PG_PASSWORD: ${resources.VectorDB.props.password}
+        CHUNK_SIZE: "512"
+        CHUNK_OVERLAP: "64"
+        MODEL_TYPE: ${vars.model_type}
+        MODELSCOPE_EMBEDDING_ENDPOINT: ${resources.Embedding.output.urlIntranet}
+        DASHSCOPE_API_KEY: ""
+        DASHSCOPE_EMBEDDING_MODEL: "text-embedding-v2"
+      asyncInvokeConfig:
+        asyncTask: true
+        maxAsyncEventAgeInSeconds: 86400
+        maxAsyncRetryAttempts: 3
+      triggers:
+        - sourceArn: "acs:oss:${vars.region}:${config(\"AccountID\")}:{{ oss_bucket }}"
+          triggerConfig:
+            events:
+              - oss:ObjectCreated:PutObject
+              - oss:ObjectCreated:PostObject
+              - oss:ObjectCreated:CompleteMultipartUpload
+              - oss:ObjectCreated:PutSymlink
+            filter:
+              key:
+                prefix: "{{oss_prefix}}"
+                suffix: ''
+          triggerName: oss
+          description: ''
+          qualifier: LATEST
+          triggerType: oss
+          invocationRole: "{{oss_invocation_role}}"
+
+  OnlineProcessor:
+    component: fc3
+    props:
+      region: ${vars.region}
+      functionName: ${vars.name}-online-processor
+      functionType: web
+      description: "在线问答：基于 LlamaIndex 搜索向量数据库、查询 LLM 并返回问题答案"
+      runtime: "custom.debian10"
+      customRuntimeConfig:
+        port: 8000
+        command:
+          - python3
+          - main.py
+      code: code/online
+      handler: index.handler
+      memorySize: 1024
+      cpu: 1
+      diskSize: 512
+      timeout: 60
+      layers:
+        - acs:fc:cn-hangzhou:1767215449378635:layers/llamaindex/versions/3
+        - acs:fc:cn-hangzhou:1767215449378635:layers/fastapi/versions/1
+        - acs:fc:cn-hangzhou:official:layers/Python3-Flask2x/versions/2
+      logConfig: auto
+      vpcConfig: auto
+      instanceLifecycleConfig:
+        initializer:
+          handler: main.initializer
+          timeout: 30
+      environmentVariables:
+        LD_LIBRARY_PATH: "/code:/code/lib:/usr/local/lib:/opt/lib:/opt/php8.1/lib:/opt/php8.0/lib:/opt/php7.2/lib"
+        PATH: "/var/fc/lang/python3.10/bin:/usr/local/bin/apache-maven/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ruby/bin:/opt/bin:/code:/code/bin"
+        PYTHONPATH: "/opt/python:/code"
+        PG_HOST: ${resources.VectorDB.output.host}
+        PG_DATABASE: ${resources.VectorDB.props.database}
+        TABLE_NAME: "llamaindex_default"
+        PG_USER: ${resources.VectorDB.props.username}
+        PG_PASSWORD: ${resources.VectorDB.props.password}
+        MODEL_TYPE: ${vars.model_type}
+        MODELSCOPE_EMBEDDING_ENDPOINT: ${resources.Embedding.output.urlIntranet}
+        OLLAMA_LLM_ENDPOINT: ${resources.LLM.output.urlIntranet}
+        DASHSCOPE_API_KEY: ""
+        DASHSCOPE_EMBEDDING_MODEL: "text-embedding-v2"
+      triggers:
+        - triggerConfig:
+            methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            authType: anonymous
+            disableURLInternet: false
+          triggerName: defaultTrigger
+          description: ''
+          qualifier: LATEST
+          triggerType: http
+      provisionConfig:
+        target: 1
+        alwaysAllocateGPU: false
+        scheduledActions: []
+
+  WebUI:
+    component: fc3
+    props:
+      region: ${vars.region}
+      handler: index.handler
+      description: "在线问答的 WebUI：将开源项目 ChatGPT-NextWeb 部署到阿里云函数计算"
+      timeout: 60
+      diskSize: 512
+      internetAccess: true
+      functionName: ${vars.name}-webui-nextchat
+      functionType: web
+      runtime: custom-container
+      cpu: 0.35
+      customContainerConfig:
+        image: registry-vpc.${vars.region}.aliyuncs.com/aliyun-fc/nextchat:v1
+        port: 3000
+      version: LATEST
+      instanceConcurrency: 20
+      environmentVariables:
+        BASE_URL: ${resources.OnlineProcessor.info.url.system_intranet_url}
+        CUSTOM_MODELS: -all,llama3
+      memorySize: 512
+      logConfig: auto
+      triggers:
+        - triggerConfig:
+            methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            authType: anonymous
+            disableURLInternet: false
+          triggerName: defaultTrigger
+          description: ''
+          qualifier: LATEST
+          triggerType: http
+      customDomain:
+        protocol: "HTTP"
+        route:
+          path: "/*"
+          qualifier: "LATEST"
+        domainName: auto
