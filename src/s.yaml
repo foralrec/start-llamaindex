@@ -42,7 +42,7 @@ resources:
         gpuType: fc.gpu.tesla.1
       nasConfig: auto
       vpcConfig: auto
-      logConfig: auto
+      # logConfig: auto
       timeout: 6000
       annotations:
         instanceType: "{{ embedding_instance_type }}"
@@ -67,7 +67,7 @@ resources:
       gpuConfig:
         gpuMemorySize: 16384
         gpuType: fc.gpu.tesla.1
-      logConfig: auto
+      # logConfig: auto
       runtime: custom-container
       customContainerConfig:
         port: 8000
